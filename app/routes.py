@@ -4,11 +4,12 @@ import uuid
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
-from .db import get_db, rollback_quietly
+from .db import INTERNAL_SOURCE, get_db, rollback_quietly
 from .logic import (
     ApiError,
     apply_transcript_batch,
     import_base_data,
+    parse_source,
     recompute_student,
     revoke_record,
     student_snapshot,
@@ -19,6 +20,19 @@ bp = Blueprint("main", __name__)
 
 def _wants_json():
     return request.path.startswith("/api/")
+
+
+def _read_revoke_source(default=INTERNAL_SOURCE):
+    """撤销请求的来源：JSON 正文/表单 source 字段，或 ?source= 查询参数；省略按校内。"""
+    value = None
+    body = request.get_json(silent=True) if request.is_json else None
+    if isinstance(body, dict):
+        value = body.get("source")
+    if value is None and "source" in request.form:
+        value = request.form.get("source")
+    if value is None and "source" in request.args:
+        value = request.args.get("source")
+    return parse_source(value, default=default)
 
 
 def _read_json_payload():
@@ -33,6 +47,20 @@ def _read_json_payload():
         return json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise ApiError(f"JSON 解析失败：{e}")
+
+
+def _apply_upload(db):
+    """解析上传正文并按批入账；网页表单填写的来源作为批次默认值。"""
+    payload = _read_json_payload()
+    if request.is_json:
+        return apply_transcript_batch(db, payload, batch_id=uuid.uuid4().hex[:12])
+    form_source = request.form.get("source")
+    if form_source is not None and form_source.strip():
+        if not isinstance(payload, dict):
+            raise ApiError("成绩单 JSON 顶层必须是对象")
+        payload = dict(payload)
+        payload.setdefault("source", form_source)
+    return apply_transcript_batch(db, payload, batch_id=uuid.uuid4().hex[:12])
 
 
 # ---------------------------------------------------------------- 网页
@@ -62,9 +90,8 @@ def upload():
     if request.method == "POST":
         db = get_db()
         try:
-            payload = _read_json_payload()
             db.execute("BEGIN IMMEDIATE")
-            result = apply_transcript_batch(db, payload, batch_id=uuid.uuid4().hex[:12])
+            result = _apply_upload(db)
             db.execute("COMMIT")
         except ApiError as e:
             rollback_quietly(db)
@@ -88,8 +115,9 @@ def revoke(record_id):
     db = get_db()
     student_id = request.form.get("student_id", "")
     try:
+        source = _read_revoke_source()
         db.execute("BEGIN IMMEDIATE")
-        result = revoke_record(db, record_id)
+        result = revoke_record(db, record_id, source)
         db.execute("COMMIT")
     except ApiError as e:
         rollback_quietly(db)
@@ -99,7 +127,7 @@ def revoke(record_id):
         rollback_quietly(db)
         flash(f"撤销失败，已沿用原账：{e}", "err")
         return redirect(request.referrer or url_for("main.index"))
-    flash(f"单号 {record_id} 已撤销并重核：该生已认定总学分 {result['total_credits']}", "ok")
+    flash(f"来源 {source} 的单号 {record_id} 已撤销并重核：该生已认定总学分 {result['total_credits']}", "ok")
     return redirect(url_for("main.student", student_id=student_id or result["student_id"]))
 
 
@@ -184,8 +212,9 @@ def api_upload_transcript():
 def api_revoke(record_id):
     db = get_db()
     try:
+        source = _read_revoke_source()
         db.execute("BEGIN IMMEDIATE")
-        result = revoke_record(db, record_id)
+        result = revoke_record(db, record_id, source)
         db.execute("COMMIT")
     except ApiError as e:
         rollback_quietly(db)
@@ -193,7 +222,25 @@ def api_revoke(record_id):
     except Exception as e:
         rollback_quietly(db)
         return jsonify({"ok": False, "error": f"撤销失败，已沿用原账：{e}"}), 500
-    return jsonify({"ok": True, **result})
+    return jsonify({"ok": True, "source": source, **result})
+
+
+@bp.route("/api/records/<source>/<record_id>/revoke", methods=["POST"])
+def api_revoke_sourced(source, record_id):
+    """按路径显式给出「来源+单号」的撤销写法。"""
+    db = get_db()
+    try:
+        src = parse_source(source)
+        db.execute("BEGIN IMMEDIATE")
+        result = revoke_record(db, record_id, src)
+        db.execute("COMMIT")
+    except ApiError as e:
+        rollback_quietly(db)
+        return jsonify({"ok": False, "error": e.message}), e.status
+    except Exception as e:
+        rollback_quietly(db)
+        return jsonify({"ok": False, "error": f"撤销失败，已沿用原账：{e}"}), 500
+    return jsonify({"ok": True, "source": src, **result})
 
 
 @bp.route("/api/students/<student_id>")

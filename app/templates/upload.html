@@ -5,12 +5,17 @@
 <div class="card">
   <p>每批对应一名学生；每条记录含 <code>单号 record_id</code>、<code>课程 course_id</code>、
      <code>开课日 start_date</code>、<code>结课日 end_date</code>、<code>是否通过 passed</code>。
-     同一单号再次上传即为<b>更正</b>；成绩与核定底表一并入账，失败则整体沿用原账。</p>
+     可在批次顶层用 <code>source</code> 填写来源校代码（如联合培养的外校代码），
+     每条记录也可单独用 <code>source</code> 覆盖；省略时按校内处理。</p>
+  <p>同一来源内再次上传同一单号即为<b>更正</b>；不同来源可以共用同一个单号。
+     成绩与核定底表一并入账，失败则整体沿用原账。</p>
   <form method="post" enctype="multipart/form-data">
+    <p>来源校代码（按批，可省略＝校内）：<input name="source" placeholder="如 EXT001"></p>
     <p>选择 JSON 文件：<input type="file" name="file" accept=".json,application/json"></p>
-    <p>或直接粘贴 JSON：</p>
+    <p>或直接粘贴 JSON（其中的 <code>source</code> 优先于上方填写）：</p>
     <textarea name="payload" rows="14" placeholder='{
   "student_id": "S001",
+  "source": "EXT001",
   "records": [
     {"record_id": "R1001", "course_id": "CS101", "start_date": "2022-09-01", "end_date": "2023-01-10", "passed": true}
   ]

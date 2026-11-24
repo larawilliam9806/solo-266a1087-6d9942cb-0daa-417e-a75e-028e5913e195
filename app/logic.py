@@ -1,16 +1,23 @@
 """核心业务：底表导入、成绩单入账（上传/更正/撤销）、按学生重核并写入核定底表。
 
+成绩唯一键是 (来源校代码 source, 单号 record_id)：同一来源内单号全库唯一，
+不同来源可以同号。未提供来源的请求按校内（INTERNAL）处理。
+
 规则：
 - 修读合规：开课前已结课（前置课结课日 < 本课开课日）且通过所有必修前置课，
   且作为依据的前置课成绩单本身也须修读合规（递归，由开课日先后自然成 DAG）。
-- 合规且通过才计学分；同一学生同一门课只计一次（取结课最早、单号最小者）。
-- 依据被撤销后重核：有合规旧单可替代则依据单号自动更新，否则受影响的后续课
+  前置课依据可以取任意来源的成绩单。
+- 合规且通过才计学分；同一学生同一门课只计一次。
+- 选择计分单或前置课依据时，结课日与单号都相同则优先校内单，其余按来源代码排序。
+- 依据被撤销后重核：有合规旧单可替代则依据自动更新，否则受影响的后续课
   逐级重核为不合规，学分相应回收。
 - 成绩与核定底表在同一事务入账；任何失败整体回滚，沿用原账。
 """
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
+
+from .db import INTERNAL_SOURCE
 
 
 class ApiError(Exception):
@@ -43,6 +50,28 @@ def parse_passed(value):
     if isinstance(value, int) and value in (0, 1):
         return value
     raise ApiError(f"passed 必须是 true/false：{value!r}")
+
+
+def parse_source(value, default=INTERNAL_SOURCE):
+    """来源校代码：可省略（按校内）；null/空串或 INTERNAL 同样按校内。"""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ApiError(f"来源校代码 source 必须是字符串：{value!r}")
+    value = value.strip()
+    if not value or value.upper() == INTERNAL_SOURCE:
+        return INTERNAL_SOURCE
+    return value
+
+
+def source_rank(source):
+    """来源排序：校内优先，其余按代码升序。用于同日同号时的稳定取舍。"""
+    return (0 if source == INTERNAL_SOURCE else 1, source)
+
+
+def record_sort_key(rec):
+    """单号排序：结课日 → 单号 → 来源（校内优先）。"""
+    return (rec["end_date"], rec["record_id"], source_rank(rec["source"]))
 
 
 # ---------------------------------------------------------------- 底表导入
@@ -124,11 +153,12 @@ def recompute_student(db, student_id):
         prereqs[r["course_id"]].append(r["prereq_course_id"])
 
     rows = db.execute(
-        "SELECT record_id, course_id, start_date, end_date, passed FROM records "
-        "WHERE student_id = ? AND status = 'active' ORDER BY start_date, record_id",
+        "SELECT source, record_id, course_id, start_date, end_date, passed FROM records "
+        "WHERE student_id = ? AND status = 'active' ORDER BY start_date, record_id, source",
         (student_id,),
     ).fetchall()
 
+    # 按来源分组的前置课候选：不同来源的成绩单都可以作为依据。
     by_course = defaultdict(list)
     for r in rows:
         by_course[r["course_id"]].append(r)
@@ -137,43 +167,48 @@ def recompute_student(db, student_id):
     # 因此“依据单本身也须合规”在此自然满足，且不会成环。
     compliant, evidences = {}, {}
     for r in rows:
+        key = (r["source"], r["record_id"])
         evidence, ok = {}, True
         for pc in prereqs.get(r["course_id"], []):
             best = None
             for c in by_course.get(pc, []):
-                if c["end_date"] < r["start_date"] and c["passed"] and compliant.get(c["record_id"]):
-                    if best is None or (c["end_date"], c["record_id"]) < (best["end_date"], best["record_id"]):
+                if (c["end_date"] < r["start_date"] and c["passed"]
+                        and compliant.get((c["source"], c["record_id"]))):
+                    if best is None or record_sort_key(c) < record_sort_key(best):
                         best = c
-            evidence[pc] = best["record_id"] if best else None
+            evidence[pc] = (
+                {"record_id": best["record_id"], "source": best["source"]} if best else None
+            )
             if best is None:
                 ok = False
-        compliant[r["record_id"]] = ok
-        evidences[r["record_id"]] = evidence
+        compliant[key] = ok
+        evidences[key] = evidence
 
-    # 同一门课只计一次：结课最早、单号最小的合规且通过单
+    # 同一门课只计一次：结课最早、单号最小；同日同号优先校内，其次来源代码序。
     source_of = {}
-    for r in sorted(rows, key=lambda x: (x["end_date"], x["record_id"])):
-        if compliant[r["record_id"]] and r["passed"] and r["course_id"] not in source_of:
-            source_of[r["course_id"]] = r["record_id"]
+    for r in sorted(rows, key=record_sort_key):
+        if compliant[(r["source"], r["record_id"])] and r["passed"] and r["course_id"] not in source_of:
+            source_of[r["course_id"]] = r
 
     db.execute("DELETE FROM record_audit WHERE student_id = ?", (student_id,))
     db.execute("DELETE FROM course_credits WHERE student_id = ?", (student_id,))
     db.execute("DELETE FROM student_credits WHERE student_id = ?", (student_id,))
 
     for r in rows:
-        rid = r["record_id"]
-        counted = 1 if source_of.get(r["course_id"]) == rid else 0
+        rid, src = r["record_id"], r["source"]
+        picked = source_of.get(r["course_id"])
+        counted = 1 if picked is not None and (picked["source"], picked["record_id"]) == (src, rid) else 0
         db.execute(
-            "INSERT INTO record_audit (record_id, student_id, course_id, passed, compliant, counted, evidence, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (rid, student_id, r["course_id"], r["passed"],
-             1 if compliant[rid] else 0, counted,
-             json.dumps(evidences[rid], ensure_ascii=False), now),
+            "INSERT INTO record_audit (source, record_id, student_id, course_id, passed, compliant, counted, evidence, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (src, rid, student_id, r["course_id"], r["passed"],
+             1 if compliant[(src, rid)] else 0, counted,
+             json.dumps(evidences[(src, rid)], ensure_ascii=False), now),
         )
-    for cid, rid in source_of.items():
+    for cid, r in source_of.items():
         db.execute(
-            "INSERT INTO course_credits (student_id, course_id, source_record_id) VALUES (?,?,?)",
-            (student_id, cid, rid),
+            "INSERT INTO course_credits (student_id, course_id, source, source_record_id) VALUES (?,?,?,?)",
+            (student_id, cid, r["source"], r["record_id"]),
         )
     total = round(sum(credits_of.get(cid, 0.0) for cid in source_of), 6)
     db.execute(
@@ -190,16 +225,13 @@ def recompute_student(db, student_id):
 
 # ---------------------------------------------------------------- 成绩单入账
 
-def _validate_record_payload(db, rec, idx, seen_in_batch):
+def _validate_record_payload(db, rec, idx):
     if not isinstance(rec, dict):
         raise ApiError(f"records[{idx}] 必须是对象")
     rid = rec.get("record_id")
     if not isinstance(rid, str) or not rid.strip():
         raise ApiError(f"records[{idx}] 缺少单号 record_id")
     rid = rid.strip()
-    if rid in seen_in_batch:
-        raise ApiError(f"批内单号重复：{rid}")
-    seen_in_batch.add(rid)
 
     cid = rec.get("course_id")
     if not isinstance(cid, str) or not cid.strip():
@@ -217,7 +249,11 @@ def _validate_record_payload(db, rec, idx, seen_in_batch):
 
 
 def apply_transcript_batch(db, payload, batch_id):
-    """分批上传：新单入账、同号单更正；随后只复核该生。调用方负责事务。"""
+    """分批上传：新单入账、同来源同号单更正；随后只复核该生。调用方负责事务。
+
+    来源可在批次顶层给默认值（source），每条记录可用 source 覆盖；
+    两者都省略时按校内处理。
+    """
     if not isinstance(payload, dict):
         raise ApiError("成绩单 JSON 顶层必须是对象")
     student_id = payload.get("student_id")
@@ -227,46 +263,69 @@ def apply_transcript_batch(db, payload, batch_id):
     records = payload.get("records")
     if not isinstance(records, list) or not records:
         raise ApiError("records 必须是非空数组")
+    batch_source = parse_source(payload.get("source"))
 
     now = now_iso()
     seen, added, corrected = set(), 0, 0
+    sources = set()
     for i, rec in enumerate(records, 1):
-        rid, cid, start, end, passed = _validate_record_payload(db, rec, i, seen)
-        old = db.execute("SELECT student_id, status FROM records WHERE record_id = ?", (rid,)).fetchone()
+        rid, cid, start, end, passed = _validate_record_payload(db, rec, i)
+        source = batch_source
+        if "source" in rec:
+            source = parse_source(rec.get("source"), default=batch_source)
+        key = (source, rid)
+        if key in seen:
+            raise ApiError(f"同一来源批内单号重复：{source} / {rid}")
+        seen.add(key)
+        sources.add(source)
+
+        old = db.execute(
+            "SELECT student_id, status FROM records WHERE source = ? AND record_id = ?",
+            (source, rid),
+        ).fetchone()
         if old is None:
             db.execute(
-                "INSERT INTO records (record_id, student_id, course_id, start_date, end_date, passed,"
-                " status, batch_id, created_at, updated_at) VALUES (?,?,?,?,?,?,'active',?,?,?)",
-                (rid, student_id, cid, start, end, passed, batch_id, now, now),
+                "INSERT INTO records (source, record_id, student_id, course_id, start_date, end_date,"
+                " passed, status, batch_id, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,'active',?,?,?)",
+                (source, rid, student_id, cid, start, end, passed, batch_id, now, now),
             )
             added += 1
         else:
             if old["student_id"] != student_id:
-                raise ApiError(f"单号 {rid} 属于其他学生，不能更正")
+                raise ApiError(f"来源 {source} 的单号 {rid} 属于其他学生，不能更正")
             if old["status"] != "active":
-                raise ApiError(f"单号 {rid} 已撤销，不能更正")
+                raise ApiError(f"来源 {source} 的单号 {rid} 已撤销，不能更正")
             db.execute(
                 "UPDATE records SET course_id=?, start_date=?, end_date=?, passed=?, batch_id=?, updated_at=?"
-                " WHERE record_id = ?",
-                (cid, start, end, passed, batch_id, now, rid),
+                " WHERE source = ? AND record_id = ?",
+                (cid, start, end, passed, batch_id, now, source, rid),
             )
             corrected += 1
 
     result = recompute_student(db, student_id)
-    result.update({"batch_id": batch_id, "added": added, "corrected": corrected})
+    result.update({
+        "batch_id": batch_id,
+        "added": added,
+        "corrected": corrected,
+        "sources": sorted(sources, key=source_rank),
+    })
     return result
 
 
-def revoke_record(db, record_id):
-    """按单号撤销，随后只复核该生（替代/连锁重核在 recompute 内完成）。"""
-    row = db.execute("SELECT student_id, status FROM records WHERE record_id = ?", (record_id,)).fetchone()
+def revoke_record(db, record_id, source=INTERNAL_SOURCE):
+    """按来源+单号撤销，随后只复核该生（替代/连锁重核在 recompute 内完成）。"""
+    row = db.execute(
+        "SELECT student_id, status FROM records WHERE source = ? AND record_id = ?",
+        (source, record_id),
+    ).fetchone()
     if row is None:
-        raise ApiError(f"单号 {record_id} 不存在", 404)
+        raise ApiError(f"来源 {source} 的单号 {record_id} 不存在", 404)
     if row["status"] == "revoked":
-        raise ApiError(f"单号 {record_id} 已是撤销状态", 409)
+        raise ApiError(f"来源 {source} 的单号 {record_id} 已是撤销状态", 409)
     db.execute(
-        "UPDATE records SET status='revoked', updated_at=? WHERE record_id = ?",
-        (now_iso(), record_id),
+        "UPDATE records SET status='revoked', updated_at=? WHERE source = ? AND record_id = ?",
+        (now_iso(), source, record_id),
     )
     return recompute_student(db, row["student_id"])
 
@@ -279,30 +338,38 @@ def student_snapshot(db, student_id):
         "SELECT total_credits, updated_at FROM student_credits WHERE student_id = ?", (student_id,)
     ).fetchone()
     cc = db.execute(
-        "SELECT course_id, source_record_id FROM course_credits WHERE student_id = ? ORDER BY course_id",
+        "SELECT course_id, source, source_record_id FROM course_credits"
+        " WHERE student_id = ? ORDER BY course_id",
         (student_id,),
     ).fetchall()
     recs = db.execute(
-        "SELECT r.record_id, r.course_id, r.start_date, r.end_date, r.passed, r.status, r.batch_id,"
-        "       a.compliant, a.counted, a.evidence"
-        " FROM records r LEFT JOIN record_audit a ON a.record_id = r.record_id"
-        " WHERE r.student_id = ? ORDER BY r.start_date, r.record_id",
-        (student_id,),
+        "SELECT r.source, r.record_id, r.course_id, r.start_date, r.end_date, r.passed, r.status,"
+        "       r.batch_id, a.compliant, a.counted, a.evidence"
+        " FROM records r LEFT JOIN record_audit a"
+        "   ON a.source = r.source AND a.record_id = r.record_id"
+        " WHERE r.student_id = ?"
+        " ORDER BY r.start_date, r.record_id,"
+        "          CASE WHEN r.source = ? THEN 0 ELSE 1 END, r.source",
+        (student_id, INTERNAL_SOURCE),
     ).fetchall()
 
     out_records = []
     for r in recs:
         evidence = []
         if r["evidence"]:
-            for pc, rid in json.loads(r["evidence"]).items():
+            for pc, item in json.loads(r["evidence"]).items():
                 prow = courses.get(pc)
+                rid = item.get("record_id") if isinstance(item, dict) else item
+                src = item.get("source") if isinstance(item, dict) else None
                 evidence.append({
                     "prereq_course_id": pc,
                     "prereq_name": prow["name"] if prow else pc,
                     "record_id": rid,          # None 表示缺项
+                    "source": src,             # 依据单来源；缺项时 None
                     "missing": rid is None,
                 })
         out_records.append({
+            "source": r["source"],
             "record_id": r["record_id"],
             "course_id": r["course_id"],
             "course_name": courses[r["course_id"]]["name"] if r["course_id"] in courses else r["course_id"],
@@ -325,6 +392,7 @@ def student_snapshot(db, student_id):
                 "name": courses[row["course_id"]]["name"] if row["course_id"] in courses else row["course_id"],
                 "credits": courses[row["course_id"]]["credits"] if row["course_id"] in courses else None,
                 "source_record_id": row["source_record_id"],
+                "source": row["source"],
             }
             for row in cc
         ],
